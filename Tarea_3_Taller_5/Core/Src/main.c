@@ -102,8 +102,8 @@ TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim5;
 
-UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
+DMA_HandleTypeDef hdma_usart2_rx;
 
 /* USER CODE BEGIN PV */
 
@@ -119,10 +119,13 @@ uint8_t Decenas = 0; // variable que guarda las decenas
 uint8_t Unidades = 0;// variable que guarda las unidades
 
 volatile uint16_t g_adc_resultados[2];
-uint8_t g_uart_rx_buffer[UART_RX_BUFFER_SIZE]; // Buffer DMA
-uint8_t g_uart_cmd_buffer[UART_RX_BUFFER_SIZE]; // Buffer para procesar
-volatile uint16_t g_uart_cmd_len = 0;
-volatile uint8_t g_uart_cmd_ready = 0; // Flag: 1 = comando listo
+// Ping-pong DMA RX buffers (zero-copy processing)
+uint8_t g_uart_rx_buffer_a[UART_RX_BUFFER_SIZE];
+uint8_t g_uart_rx_buffer_b[UART_RX_BUFFER_SIZE];
+// Pointer/length pair used as ISR -> main handshake
+volatile uint8_t* g_uart_proc_buffer = NULL; // points to A or B when data ready
+volatile uint16_t g_uart_proc_len = 0;        // number of valid bytes in buffer
+volatile uint8_t g_uart_dma_active = 0;      // 0 = A active, 1 = B active
 
 
 static Estado_App_t g_estado = ESTADO_MENU;
@@ -147,7 +150,6 @@ static void MX_TIM2_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM5_Init(void);
-static void MX_USART1_UART_Init(void);
 static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
 void lightNumber(uint8_t number);
@@ -161,7 +163,7 @@ static void manejar_config_bjt(Comando_ID_t id, char* params);
 static void manejar_ejecucion_bjt(Comando_ID_t id);
 static void tick_barrido_bjt(void);
 
-/* --- Tarea 3: Prototipos de Drivers (Stubs) --- */
+static uint16_t leer_canal_adc(uint32_t channel);
 extern void setear_voltaje_base_mv(float v);
 extern void setear_voltaje_colector_mv(float v);
 extern float leer_voltaje_base_mv(void);
@@ -172,268 +174,25 @@ extern float leer_corriente_colector_ma(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+// Redirección de printf a UART2
 #ifdef __GNUC__
+/* Con GCC, small printf set a unbuffered output */
 #define PUTCHAR_PROTOTYPE int __io_putchar(int ch)
 #else
 #define PUTCHAR_PROTOTYPE int fputc(int ch, FILE *f)
-#endif
+#endif /* __GNUC__ */
+
 PUTCHAR_PROTOTYPE
 {
-	HAL_UART_Transmit(&huart2, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
+	HAL_UART_Transmit(&huart2, (uint8_t *)&ch, 1, 0xFFFF);
 	return ch;
 }
-// TODO: estudiar ṕr que las cosas estan asi
 
-
-void mostrar_menu_principal(void) {
-	const char* menu =
-			"\r\n=== Analizador BJT ===\r\n"
-			"Comandos disponibles:\r\n"
-			"1. bjt - Entrar al menú de configuración BJT\r\n"
-			"2. ayuda - Mostrar este menú\r\n"
-			"\r\n> ";
-	printf(menu);
-}
-
-void mostrar_config_bjt(void) {
-	printf("\r\n--- CONFIGURACIÓN BJT ---\r\n");
-	printf("Modo      : %s\r\n", (g_config.modo == BJT_MODO_ICVB) ? "Ic vs Vb" : "Ic vs Vc");
-	printf("Vb fijo   : %.1f mV\r\n", g_config.vb_fijo_mv);
-	printf("Vc fijo   : %.1f mV\r\n", g_config.vc_fijo_mv);
-	printf("Inicio    : %.1f mV\r\n", g_config.v_inicio_mv);
-	printf("Fin       : %.1f mV\r\n", g_config.v_fin_mv);
-	printf("Paso      : %.1f mV\r\n", g_config.v_paso_mv);
-	printf("Puntos    : %u\r\n",    g_config.puntos);
-	printf("Comandos:\r\n");
-	printf("  modo icvb | modo icvc\r\n");
-	printf("  establecer [vb|vc|inicio|fin|paso|puntos] <valor>\r\n");
-	printf("  mostrar | ayuda\r\n");
-	printf("  ejecutar\r\n");
-	printf("  volver\r\n\r\n> ");
-}
-
-static Comando_ID_t buscar_comando(const char* texto) {
-	for (size_t i = 0; i < NUM_COMANDOS; i++) {
-		if (strcmp(texto, COMANDOS[i].texto) == 0) {
-			return COMANDOS[i].id;
-		}
-	}
-	return CMD_DESCONOCIDO;
-}
-
-static void analizar_y_ejecutar_comando(uint8_t* buffer, uint16_t tamaño)
+int _write(int file, char *ptr, int len)
 {
-
-
-	char* texto_comando = strtok((char*)buffer, " \r\n");
-	char* parametros    = strtok(NULL, ""); // El resto de la línea
-
-	if (texto_comando == NULL) {
-		printf("> ");
-		return; // Buffer vacío o solo espacios
-	}
-
-	Comando_ID_t id = buscar_comando(texto_comando);
-	despachar_comando(id, parametros);
+	HAL_UART_Transmit(&huart2, (uint8_t *)ptr, len, 0xFFFF);
+	return len;
 }
-
-static void despachar_comando(Comando_ID_t id, char* params) {
-	switch (g_estado) {
-	case ESTADO_MENU:
-		manejar_menu(id, params);
-		break;
-	case ESTADO_CONFIG_BJT:
-		manejar_config_bjt(id, params);
-		break;
-	case ESTADO_EJECUTANDO_BJT:
-		manejar_ejecucion_bjt(id);
-		break;
-	}
-}
-
-static void manejar_menu(Comando_ID_t id, char* params) {
-	switch (id) {
-	case CMD_AYUDA:
-		mostrar_menu_principal();
-		break;
-	case CMD_BJT:
-		g_estado = ESTADO_CONFIG_BJT;
-		mostrar_config_bjt();
-		break;
-	default:
-		printf("Comando inválido. Use 'ayuda'.\r\n> ");
-		break;
-	}
-}
-
-static void manejar_config_bjt(Comando_ID_t id, char* params) {
-	switch (id) {
-	case CMD_AYUDA:
-	case CMD_MOSTRAR:
-		mostrar_config_bjt();
-		break;
-
-	case CMD_MODO:
-		if (!params) {
-			printf("Uso: modo [icvb|icvc]\r\n> ");
-		} else if (strcmp(params, "icvb") == 0) {
-			g_config.modo = BJT_MODO_ICVB;
-			printf("Modo: Ic vs Vb\r\n> ");
-		} else if (strcmp(params, "icvc") == 0) {
-			g_config.modo = BJT_MODO_ICVC;
-			printf("Modo: Ic vs Vc\r\n> ");
-		} else {
-			printf("Modo inválido. Use 'icvb' o 'icvc'.\r\n> ");
-		}
-		break;
-
-	case CMD_ESTABLECER: {
-		if (!params) {
-			printf("Uso: establecer [param] <valor>\r\n> ");
-			break;
-		}
-
-		char* param = strtok(params, " ");
-		char* valor = strtok(NULL, " \r\n");
-
-		if (!param || !valor) {
-			printf("Parámetros incompletos.\r\n> ");
-			break;
-		}
-
-		if (strcmp(param, "puntos") == 0) {
-			g_config.puntos = (uint16_t)atoi(valor);
-		} else {
-			float v = atof(valor);
-			if (strcmp(param, "vb") == 0)         g_config.vb_fijo_mv = v;
-			else if (strcmp(param, "vc") == 0)    g_config.vc_fijo_mv = v;
-			else if (strcmp(param, "inicio") == 0) g_config.v_inicio_mv = v;
-			else if (strcmp(param, "fin") == 0)    g_config.v_fin_mv = v;
-			else if (strcmp(param, "paso") == 0)   g_config.v_paso_mv = v;
-			else {
-				printf("Parámetro '%s' inválido.\r\n> ", param);
-				break;
-			}
-		}
-		printf("Actualizado: %s = %s\r\n> ", param, valor);
-		break;
-	}
-
-	case CMD_EJECUTAR:
-		printf("Iniciando barrido...\r\n");
-		// Encabezados de la tabla CSV
-		printf("Indice,Vb_mV,Vc_mV,Ic_mA\r\n");
-		g_estado = ESTADO_EJECUTANDO_BJT;
-		// El barrido se ejecuta en tick_barrido_bjt()
-		break;
-
-	case CMD_VOLVER:
-		g_estado = ESTADO_MENU;
-		mostrar_menu_principal();
-		break;
-
-	default:
-		printf("Comando inválido. Use 'mostrar' o 'ayuda'.\r\n> ");
-		break;
-	}
-}
-
-
-static void manejar_ejecucion_bjt(Comando_ID_t id) {
-   // Durante la ejecución, cualquier comando detiene el barrido
-   printf("\r\n¡Barrido abortado por el usuario!\r\n");
-   g_estado = ESTADO_CONFIG_BJT;
-   mostrar_config_bjt();
-}
-
-
-static void tick_barrido_bjt(void) {
-   static uint16_t indice = 0;
-   static uint8_t activo = 0;
-
-   // Solo operar en estado de ejecución
-   if (g_estado != ESTADO_EJECUTANDO_BJT) {
-       activo = 0; // Resetea el estado si salimos de ejecución
-       return;
-   }
-
-   // Inicializar al entrar
-   if (!activo) {
-       indice = 0;
-       activo = 1;
-       // TODO: Inicializar hardware (DAC, ADC, etc.) si es necesario
-   }
-
-   // Verificar fin del barrido
-   if (g_config.puntos == 0 || (g_config.v_paso_mv == 0 && g_config.puntos > 1)) {
-       printf("Error: 'puntos' o 'paso' no configurados.\r\n");
-       g_estado = ESTADO_CONFIG_BJT;
-       mostrar_config_bjt();
-       return;
-   }
-
-   if (indice >= g_config.puntos) {
-       printf("Barrido completado.\r\n");
-       g_estado = ESTADO_CONFIG_BJT;
-       mostrar_config_bjt();
-       return;
-   }
-
-   // Calcular voltaje de barrido
-   float v_barrido = g_config.v_inicio_mv + (float)indice * g_config.v_paso_mv;
-
-   // Aplicar voltajes según modo
-   float vb_aplicado, vc_aplicado;
-   if (g_config.modo == BJT_MODO_ICVB) {
-       vb_aplicado = v_barrido;
-       vc_aplicado = g_config.vc_fijo_mv;
-   } else { // BJT_MODO_ICVC
-       vb_aplicado = g_config.vb_fijo_mv;
-       vc_aplicado = v_barrido;
-   }
-
-   setear_voltaje_base_mv(vb_aplicado);
-   setear_voltaje_colector_mv(vc_aplicado);
-
-   // TODO: Implementar "delay" de asentamiento apropiado
-
-   // Medir valores
-   float vb_medido = leer_voltaje_base_mv();
-   float vc_medido = leer_voltaje_colector_mv();
-   float ic_medido = leer_corriente_colector_ma();
-
-   // Transmitir datos en formato CSV
-   printf("%u,%.2f,%.2f,%.3f\r\n", indice, vb_medido, vc_medido, ic_medido);
-
-   indice++;
-}
-
-
-
-
-void setear_voltaje_base_mv(float v_mv) {
-    // TODO: Implementar PWM para Vb
-}
-void setear_voltaje_colector_mv(float v_mv) {
-    // TODO: Implementar PWM para Vc
-}
-float leer_voltaje_base_mv(void) {
-    // TODO: Implementar ADC para Vb
-    return 0.0f; // Placeholder
-}
-
-
-float leer_voltaje_colector_mv(void){
-	//TODO
-	return 0.0f;
-}
-
-float leer_corriente_colector_ma(void){
-	//TODO
-	return 0.0f;
-}
-
-
 
 /* USER CODE END 0 */
 
@@ -470,28 +229,26 @@ int main(void)
   MX_TIM3_Init();
   MX_ADC1_Init();
   MX_TIM5_Init();
-  MX_USART1_UART_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
-  	HAL_TIM_Base_Start_IT(&htim2); // Tu Blinky
-  	HAL_TIM_Base_Start_IT(&htim3); // Tu Display
+	HAL_TIM_Base_Start_IT(&htim2); // Tu Blinky
+	HAL_TIM_Base_Start_IT(&htim3); // Tu Display
 
-  	HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
-  	HAL_NVIC_EnableIRQ(EXTI2_IRQn);
-  	HAL_RCC_MCOConfig(RCC_MCO1, RCC_MCO1SOURCE_PLLCLK, RCC_MCO_DIV4);
+	HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+	HAL_NVIC_EnableIRQ(EXTI2_IRQn);
 
-      // --- INICIAR NUEVO HARDWARE ---
-      // Iniciar AMBOS canales del TIM5
-      HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_1); // Vc en Canal 1
-      HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_2); // Vb en Canal 2
+	// --- INICIAR NUEVO HARDWARE ---
+	// Iniciar AMBOS canales del TIM5
+	HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_1); // Vc en Canal 1
+	HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_2); // Vb en Canal 2
 
-      // Iniciar el ADC en modo DMA circular
-      HAL_ADC_Start_DMA(&hadc1, (uint32_t*)g_adc_resultados, 2);
+	// Iniciar el ADC en modo DMA circular
+	HAL_ADC_Start_DMA(&hadc1, (uint32_t*)g_adc_resultados, 2);
 
-      // --- INICIAR UART DMA ---
-      // (Esto ya lo tenías en el while, es mejor ponerlo aquí una sola vez)
-      HAL_UARTEx_ReceiveToIdle_DMA(&huart2, g_uart_rx_buffer, UART_RX_BUFFER_SIZE);
-      __HAL_DMA_DISABLE_IT(huart2.hdmarx, DMA_IT_HT);
+	// --- INICIAR UART DMA (ping-pong: empezar en buffer A) ---
+	// Se arranca la recepción en el buffer A; el callback cambiará al otro.
+	g_uart_dma_active = 0; // DMA escribirá en A
+	HAL_UARTEx_ReceiveToIdle_DMA(&huart2, g_uart_rx_buffer_a, UART_RX_BUFFER_SIZE);
 
 
 
@@ -580,25 +337,26 @@ int main(void)
 
 		}
 
-		if (g_uart_cmd_ready)
+		// --- Nuevo flujo ping-pong: procesar buffer marcado por ISR ---
+		if (g_uart_proc_len > 0 && g_uart_proc_buffer != NULL)
 		{
-		    uint16_t len = g_uart_cmd_len;
+			// Claim the packet: copy volatile values to locals, then clear the shared ones
+			uint8_t* proc_buf = (uint8_t*)g_uart_proc_buffer;
+			uint16_t len = g_uart_proc_len;
 
-		    if (len >= UART_RX_BUFFER_SIZE) {
-		        len = UART_RX_BUFFER_SIZE - 1;
-		    }
+			// Clear handshake immediately to mark "consumed"
+			g_uart_proc_buffer = NULL;
+			g_uart_proc_len = 0;
 
-		    memcpy(g_uart_cmd_buffer, (uint8_t*)g_uart_rx_buffer, len);
-		    g_uart_cmd_buffer[len] = '\0';
+			// Ensure null-termination for safe C-string operations
+			if (len >= UART_RX_BUFFER_SIZE) {
+				proc_buf[UART_RX_BUFFER_SIZE - 1] = '\0';
+			} else {
+				proc_buf[len] = '\0';
+			}
 
-		    g_uart_cmd_ready = 0;
-		    g_uart_cmd_len = 0;
-
-		    HAL_UARTEx_ReceiveToIdle_DMA(&huart2, g_uart_rx_buffer, UART_RX_BUFFER_SIZE);
-		    __HAL_DMA_DISABLE_IT(huart2.hdmarx, DMA_IT_HT);
-
-		    printf("\r\n");
-		    analizar_y_ejecutar_comando(g_uart_cmd_buffer, len);
+			printf("\r\n");
+			analizar_y_ejecutar_comando(proc_buf, len);
 		}
 
 		/* --- Tarea 3: Máquina de Estados BJT (No bloqueante) --- */
@@ -683,7 +441,7 @@ static void MX_ADC1_Init(void)
   hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
   hadc1.Init.Resolution = ADC_RESOLUTION_12B;
   hadc1.Init.ScanConvMode = ENABLE;
-  hadc1.Init.ContinuousConvMode = ENABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
   hadc1.Init.DiscontinuousConvMode = DISABLE;
   hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
   hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
@@ -784,9 +542,9 @@ static void MX_TIM3_Init(void)
 
   /* USER CODE END TIM3_Init 1 */
   htim3.Instance = TIM3;
-  htim3.Init.Prescaler = 9999;
+  htim3.Init.Prescaler = 50000;
   htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim3.Init.Period = 59;
+  htim3.Init.Period = 8;
   htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
   if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
@@ -864,39 +622,6 @@ static void MX_TIM5_Init(void)
 }
 
 /**
-  * @brief USART1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USART1_UART_Init(void)
-{
-
-  /* USER CODE BEGIN USART1_Init 0 */
-
-  /* USER CODE END USART1_Init 0 */
-
-  /* USER CODE BEGIN USART1_Init 1 */
-
-  /* USER CODE END USART1_Init 1 */
-  huart1.Instance = USART1;
-  huart1.Init.BaudRate = 115200;
-  huart1.Init.WordLength = UART_WORDLENGTH_8B;
-  huart1.Init.StopBits = UART_STOPBITS_1;
-  huart1.Init.Parity = UART_PARITY_NONE;
-  huart1.Init.Mode = UART_MODE_TX_RX;
-  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
-  if (HAL_MultiProcessor_Init(&huart1, 0, UART_WAKEUPMETHOD_IDLELINE) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USART1_Init 2 */
-
-  /* USER CODE END USART1_Init 2 */
-
-}
-
-/**
   * @brief USART2 Initialization Function
   * @param None
   * @retval None
@@ -919,7 +644,7 @@ static void MX_USART2_UART_Init(void)
   huart2.Init.Mode = UART_MODE_TX_RX;
   huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
   huart2.Init.OverSampling = UART_OVERSAMPLING_16;
-  if (HAL_MultiProcessor_Init(&huart2, 0, UART_WAKEUPMETHOD_IDLELINE) != HAL_OK)
+  if (HAL_UART_Init(&huart2) != HAL_OK)
   {
     Error_Handler();
   }
@@ -937,8 +662,12 @@ static void MX_DMA_Init(void)
 
   /* DMA controller clock enable */
   __HAL_RCC_DMA2_CLK_ENABLE();
+  __HAL_RCC_DMA1_CLK_ENABLE();
 
   /* DMA interrupt init */
+  /* DMA1_Stream5_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream5_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream5_IRQn);
   /* DMA2_Stream0_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
@@ -1055,6 +784,326 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+
+
+void mostrar_menu_principal(void) {
+	const char* menu =
+			"\r\n=== Analizador BJT ===\r\n"
+			"Comandos disponibles:\r\n"
+			"1. bjt - Entrar al menú de configuración BJT\r\n"
+			"2. ayuda - Mostrar este menú\r\n"
+			"\r\n> ";
+	printf(menu);
+}
+
+void mostrar_config_bjt(void) {
+	printf("\r\n--- CONFIGURACIÓN BJT ---\r\n");
+	printf("Modo      : %s\r\n", (g_config.modo == BJT_MODO_ICVB) ? "Ic vs Vb" : "Ic vs Vc");
+	printf("Vb fijo   : %.1f mV\r\n", g_config.vb_fijo_mv);
+	printf("Vc fijo   : %.1f mV\r\n", g_config.vc_fijo_mv);
+	printf("Inicio    : %.1f mV\r\n", g_config.v_inicio_mv);
+	printf("Fin       : %.1f mV\r\n", g_config.v_fin_mv);
+	printf("Paso      : %.1f mV\r\n", g_config.v_paso_mv);
+	printf("Puntos    : %u\r\n",    g_config.puntos);
+	printf("Comandos:\r\n");
+	printf("  modo icvb | modo icvc\r\n");
+	printf("  establecer [vb|vc|inicio|fin|paso|puntos] <valor>\r\n");
+	printf("  mostrar | ayuda\r\n");
+	printf("  ejecutar\r\n");
+	printf("  volver\r\n\r\n> ");
+}
+
+static Comando_ID_t buscar_comando(const char* texto) {
+	for (size_t i = 0; i < NUM_COMANDOS; i++) {
+		if (strcmp(texto, COMANDOS[i].texto) == 0) {
+			return COMANDOS[i].id;
+		}
+	}
+	return CMD_DESCONOCIDO;
+}
+
+static void analizar_y_ejecutar_comando(uint8_t* buffer, uint16_t tamaño)
+{
+
+
+	char* texto_comando = strtok((char*)buffer, " \r\n");
+	char* parametros    = strtok(NULL, ""); // El resto de la línea
+
+	if (texto_comando == NULL) {
+		printf("> ");
+		return; // Buffer vacío o solo espacios
+	}
+
+	Comando_ID_t id = buscar_comando(texto_comando);
+	despachar_comando(id, parametros);
+}
+
+static void despachar_comando(Comando_ID_t id, char* params) {
+	switch (g_estado) {
+	case ESTADO_MENU:
+		manejar_menu(id, params);
+		break;
+	case ESTADO_CONFIG_BJT:
+		manejar_config_bjt(id, params);
+		break;
+	case ESTADO_EJECUTANDO_BJT:
+		manejar_ejecucion_bjt(id);
+		break;
+	}
+}
+
+static void manejar_menu(Comando_ID_t id, char* params) {
+	switch (id) {
+	case CMD_AYUDA:
+		mostrar_menu_principal();
+		break;
+	case CMD_BJT:
+		g_estado = ESTADO_CONFIG_BJT;
+		mostrar_config_bjt();
+		break;
+	default:
+		printf("Comando inválido. Use 'ayuda'.\r\n> ");
+		break;
+	}
+}
+
+static void manejar_config_bjt(Comando_ID_t id, char* params) {
+	switch (id) {
+	case CMD_AYUDA:
+	case CMD_MOSTRAR:
+		if (params != NULL) {
+			// Allow: mostrar vb | mostrar vc | mostrar ic
+			if (strcmp(params, "vb") == 0) {
+				float vb = leer_voltaje_base_mv();
+				printf("Vb medido: %.2f mV\r\n> ", vb);
+				break;
+			} else if (strcmp(params, "vc") == 0) {
+				float vc = leer_voltaje_colector_mv();
+				printf("Vc medido: %.2f mV\r\n> ", vc);
+				break;
+			} else if (strcmp(params, "ic") == 0) {
+				float ic = leer_corriente_colector_ma();
+				printf("Ic medido: %.3f mA\r\n> ", ic);
+				break;
+			}
+		}
+		// Default: show configuration
+		mostrar_config_bjt();
+		break;
+
+
+	case CMD_MODO:
+		if (!params) {
+			printf("Uso: modo [icvb|icvc]\r\n> ");
+		} else if (strcmp(params, "icvb") == 0) {
+			g_config.modo = BJT_MODO_ICVB;
+			printf("Modo: Ic vs Vb\r\n> ");
+		} else if (strcmp(params, "icvc") == 0) {
+			g_config.modo = BJT_MODO_ICVC;
+			printf("Modo: Ic vs Vc\r\n> ");
+		} else {
+			printf("Modo inválido. Use 'icvb' o 'icvc'.\r\n> ");
+		}
+		break;
+
+	case CMD_ESTABLECER: {
+		if (!params) {
+			printf("Uso: establecer [param] <valor>\r\n> ");
+			break;
+		}
+
+		char* param = strtok(params, " ");
+		char* valor = strtok(NULL, " \r\n");
+
+		if (!param || !valor) {
+			printf("Parámetros incompletos.\r\n> ");
+			break;
+		}
+
+		if (strcmp(param, "puntos") == 0) {
+			g_config.puntos = (uint16_t)atoi(valor);
+		} else {
+			float v = atof(valor);
+			if (strcmp(param, "vb") == 0)         g_config.vb_fijo_mv = v;
+			else if (strcmp(param, "vc") == 0)    g_config.vc_fijo_mv = v;
+			else if (strcmp(param, "inicio") == 0) g_config.v_inicio_mv = v;
+			else if (strcmp(param, "fin") == 0)    g_config.v_fin_mv = v;
+			else if (strcmp(param, "paso") == 0)   g_config.v_paso_mv = v;
+			else {
+				printf("Parámetro '%s' inválido.\r\n> ", param);
+				break;
+			}
+		}
+
+		// Apply immediately when setting vb/vc so user can control outputs directly
+		if (strcmp(param, "vb") == 0) {
+			setear_voltaje_base_mv((float)atof(valor));
+		}
+		else if (strcmp(param, "vc") == 0) {
+			setear_voltaje_colector_mv((float)atof(valor));
+		}
+
+		printf("Actualizado: %s = %s\r\n> ", param, valor);
+		break;
+	}
+
+	case CMD_EJECUTAR:
+		printf("Iniciando barrido...\r\n");
+		// Encabezados de la tabla CSV
+		printf("Indice,Vb_mV,Vc_mV,Ic_mA\r\n");
+		g_estado = ESTADO_EJECUTANDO_BJT;
+		// El barrido se ejecuta en tick_barrido_bjt()
+		break;
+
+	case CMD_VOLVER:
+		g_estado = ESTADO_MENU;
+		mostrar_menu_principal();
+		break;
+
+	default:
+		printf("Comando inválido. Use 'mostrar' o 'ayuda'.\r\n> ");
+		break;
+	}
+}
+
+
+static void manejar_ejecucion_bjt(Comando_ID_t id) {
+	// Durante la ejecución, cualquier comando detiene el barrido
+	printf("\r\n¡Barrido abortado por el usuario!\r\n");
+	g_estado = ESTADO_CONFIG_BJT;
+	mostrar_config_bjt();
+}
+
+
+static void tick_barrido_bjt(void) {
+	static uint16_t indice = 0;
+	static uint8_t activo = 0;
+
+	// Solo operar en estado de ejecución
+	if (g_estado != ESTADO_EJECUTANDO_BJT) {
+		activo = 0; // Resetea el estado si salimos de ejecución
+		return;
+	}
+
+	// Inicializar al entrar
+	if (!activo) {
+		indice = 0;
+		activo = 1;
+		// TODO: Inicializar hardware (DAC, ADC, etc.) si es necesario
+	}
+
+	// Verificar fin del barrido
+	if (g_config.puntos == 0 || (g_config.v_paso_mv == 0 && g_config.puntos > 1)) {
+		printf("Error: 'puntos' o 'paso' no configurados.\r\n");
+		g_estado = ESTADO_CONFIG_BJT;
+		mostrar_config_bjt();
+		return;
+	}
+
+	if (indice >= g_config.puntos) {
+		printf("Barrido completado.\r\n");
+		g_estado = ESTADO_CONFIG_BJT;
+		mostrar_config_bjt();
+		return;
+	}
+
+	// Calcular voltaje de barrido
+	float v_barrido = g_config.v_inicio_mv + (float)indice * g_config.v_paso_mv;
+
+	// Aplicar voltajes según modo
+	float vb_aplicado, vc_aplicado;
+	if (g_config.modo == BJT_MODO_ICVB) {
+		vb_aplicado = v_barrido;
+		vc_aplicado = g_config.vc_fijo_mv;
+	} else { // BJT_MODO_ICVC
+		vb_aplicado = g_config.vb_fijo_mv;
+		vc_aplicado = v_barrido;
+	}
+
+	setear_voltaje_base_mv(vb_aplicado);
+	setear_voltaje_colector_mv(vc_aplicado);
+
+	// TODO: Implementar "delay" de asentamiento apropiado
+
+	// Medir valores
+	float vb_medido = leer_voltaje_base_mv();
+	float vc_medido = leer_voltaje_colector_mv();
+	float ic_medido = leer_corriente_colector_ma();
+
+	// Transmitir datos en formato CSV
+	printf("%u,%.2f,%.2f,%.3f\r\n", indice, vb_medido, vc_medido, ic_medido);
+
+	indice++;
+}
+
+
+
+static uint16_t leer_canal_adc(uint32_t channel) {
+	ADC_ChannelConfTypeDef sConfig = {0};
+	uint32_t adc_sum = 0;
+	uint16_t adc_value = 0;
+	const int num_samples = 16;
+
+	sConfig.Channel = channel;
+	sConfig.Rank = 1;
+	sConfig.SamplingTime = ADC_SAMPLETIME_144CYCLES;
+	if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
+		return 0;
+	}
+
+	for (int i = 0; i < num_samples; i++) {
+		HAL_ADC_Start(&hadc1);
+		if (HAL_ADC_PollForConversion(&hadc1, 100) == HAL_OK) {
+			adc_sum += HAL_ADC_GetValue(&hadc1);
+		}
+	}
+	adc_value = adc_sum / num_samples;
+	return adc_value;
+}
+
+void setear_voltaje_base_mv(float v_mv) {
+	if (v_mv < 0) v_mv = 0;
+	if (v_mv > 3300) v_mv = 3300;
+	// Map voltage to current timer ARR (supports non-1023 ARR)
+	uint32_t arr = htim5.Instance->ARR;
+	uint16_t pwm_val = (uint16_t)((v_mv / 3300.0f) * (float)arr);
+	// Base is on TIM_CHANNEL_2 (hardware: channel2 -> Vb)
+	__HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_2, pwm_val);
+}
+
+void setear_voltaje_colector_mv(float v_mv) {
+	if (v_mv < 0) v_mv = 0;
+	if (v_mv > 3300) v_mv = 3300;
+	// Map voltage to current timer ARR (supports non-1023 ARR)
+	uint32_t arr = htim5.Instance->ARR;
+	uint16_t pwm_val = (uint16_t)((v_mv / 3300.0f) * (float)arr);
+	// Colector is on TIM_CHANNEL_1 (hardware: channel1 -> Vc)
+	__HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_1, pwm_val);
+}
+
+float leer_voltaje_base_mv(void) {
+	// ADC configured channels: ADC_CHANNEL_4 (rank 1) and ADC_CHANNEL_14 (rank 2)
+	// La medición de Vb corresponde al canal ADC_CHANNEL_4
+	uint16_t adc_raw = leer_canal_adc(ADC_CHANNEL_4);
+	return (float)adc_raw * 3300.0f / 4095.0f;
+}
+
+float leer_voltaje_colector_mv(void){
+	uint16_t adc_raw = leer_canal_adc(ADC_CHANNEL_14);
+	return (float)adc_raw * 3300.0f / 4095.0f;
+}
+
+float leer_corriente_colector_ma(void){
+	uint16_t adc_raw_ve = leer_canal_adc(ADC_CHANNEL_14);
+	float ve_mv = (float)adc_raw_ve * 3300.0f / 4095.0f;
+	return ve_mv / 5.1f;
+}
+
+
+
+
+
 
 void lightNumber(uint8_t number) {
 	// Definiciones de pines para un display de 7 segmentos (a-g)
@@ -1175,40 +1224,38 @@ void lightNumber(uint8_t number) {
 }
 
 
-
-/*
- * CODIOGO PUNTO 3
- *
- *
- *
- * */
-
-
-
-
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
 	if (huart->Instance == USART2)
 	{
-		if (g_uart_cmd_ready == 0) // Si no hay un comando procesándose
-		{
-			g_uart_cmd_len = Size;
-			g_uart_cmd_ready = 1;
+		// Disable HT interrupt to avoid noisy half-transfer events
+		//		__HAL_DMA_DISABLE_IT(huart->hdmarx, DMA_IT_HT);
 
-			// Detener DMA para evitar sobreescritura
-			HAL_UART_DMAStop(&huart2);
+		// Ping-pong: the ISR marks which buffer was filled and immediately
+		// rearms the DMA to the alternate buffer so main() can process safely.
+		if (g_uart_dma_active == 0)
+		{
+			// DMA had been writing into buffer A; claim A for processing
+			g_uart_proc_buffer = g_uart_rx_buffer_a;
+			g_uart_proc_len = Size;
+
+			// Switch DMA to buffer B
+			g_uart_dma_active = 1;
+			HAL_UARTEx_ReceiveToIdle_DMA(&huart2, g_uart_rx_buffer_b, UART_RX_BUFFER_SIZE);
 		}
-		// Si ya hay un comando (g_uart_cmd_ready = 1), este nuevo se ignora
-		// y se reiniciará en el while(1) después de procesar el anterior.
+		else
+		{
+			// DMA had been writing into buffer B; claim B for processing
+			g_uart_proc_buffer = g_uart_rx_buffer_b;
+			g_uart_proc_len = Size;
+
+			// Switch DMA to buffer A
+			g_uart_dma_active = 0;
+			HAL_UARTEx_ReceiveToIdle_DMA(&huart2, g_uart_rx_buffer_a, UART_RX_BUFFER_SIZE);
+		}
 	}
 }
 
-/*
- *
- *
- *
- *
- * */
 
 
 // Callback de TIM: se llama cada vez que vence el periodo (UIF)

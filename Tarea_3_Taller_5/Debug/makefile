@@ -60,8 +60,8 @@ all: main-build
 main-build: Tarea_3_Taller_5.elf secondary-outputs
 
 # Tool invocations
-Tarea_3_Taller_5.elf Tarea_3_Taller_5.map: $(OBJS) $(USER_OBJS) /home/juan/STM32CubeIDE/workspace_1.13.2/Tarea_3_Taller_5/STM32F411RETX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "Tarea_3_Taller_5.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"/home/juan/STM32CubeIDE/workspace_1.13.2/Tarea_3_Taller_5/STM32F411RETX_FLASH.ld" --specs=nosys.specs -Wl,-Map="Tarea_3_Taller_5.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -u _printf_float -u _scanf_float -Wl,--start-group -lc -lm -Wl,--end-group
+Tarea_3_Taller_5.elf Tarea_3_Taller_5.map: $(OBJS) $(USER_OBJS) /home/juan/Documentos/GitHub/Juan_Taller_5/Tarea_3_Taller_5/STM32F411RETX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "Tarea_3_Taller_5.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"/home/juan/Documentos/GitHub/Juan_Taller_5/Tarea_3_Taller_5/STM32F411RETX_FLASH.ld" --specs=nosys.specs -Wl,-Map="Tarea_3_Taller_5.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -u _printf_float -u _scanf_float -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 
